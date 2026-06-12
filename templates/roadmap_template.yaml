@@ -1,0 +1,9 @@
+version: "v0.1"
+stages:
+  - id: "v1"
+    name: "Core Workflow"
+    status: "active"
+    items:
+      - "file_based_core"
+      - "mechanical_interview_runner"
+      - "explicit_user_continue_or_finalize"
