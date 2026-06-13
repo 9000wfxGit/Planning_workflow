@@ -8,8 +8,11 @@ from .domain.models import (
     ClarificationSession,
     CycleResult,
     ProjectSnapshot,
+    ProjectUiState,
     QuestionAdvanceResult,
+    QuestionDetail,
     QuestionPrompt,
+    QuestionTimelineItem,
 )
 
 __all__ = [
@@ -18,8 +21,11 @@ __all__ = [
     "ConfigurationError",
     "ModelOutputError",
     "ProjectSnapshot",
+    "ProjectUiState",
     "CycleResult",
     "QuestionPrompt",
+    "QuestionDetail",
+    "QuestionTimelineItem",
     "QuestionAdvanceResult",
     "ClarificationSession",
     "ClarificationReply",

@@ -16,9 +16,12 @@ from planning_workflow.domain.models import (
     ClarificationSession,
     CycleResult,
     ProjectSnapshot,
+    ProjectUiState,
     QuestionAdvanceResult,
     QuestionBatch,
+    QuestionDetail,
     QuestionPrompt,
+    QuestionTimelineItem,
     ReasoningOutput,
     normalize_answer_text,
     utc_now,
@@ -223,14 +226,122 @@ class FileRepository:
             total=len(items),
         )
 
+    def project_ui_state(self, project_id: str) -> ProjectUiState:
+        snapshot = self.snapshot(project_id)
+        timeline = self.question_timeline(project_id)
+        current = (
+            self.question_detail(project_id, snapshot.current_question_id)
+            if snapshot.current_question_id is not None
+            else None
+        )
+        return ProjectUiState(
+            project=snapshot,
+            timeline=timeline,
+            current_question=current,
+            question_count=len(timeline),
+        )
+
+    def question_timeline(self, project_id: str) -> list[QuestionTimelineItem]:
+        project_path = self.require_project(project_id)
+        queue = self._read_json(project_path / "questions" / "queue.json")
+        items = queue.get("items", [])
+        current_id = self.snapshot(project_id).current_question_id
+        answers = self._answers_by_question(project_id, queue.get("batch_id"))
+        clarifications = self._clarifications_by_question(project_id)
+        total = len(items)
+        timeline: list[QuestionTimelineItem] = []
+        for index, item in enumerate(items, start=1):
+            question_id = item["id"]
+            answer = answers.get(question_id)
+            branches = clarifications.get(question_id, [])
+            active_count = sum(1 for branch in branches if branch.status == "active")
+            timeline.append(
+                QuestionTimelineItem(
+                    project_id=project_id,
+                    batch_id=queue.get("batch_id"),
+                    question_id=question_id,
+                    question=item["question"],
+                    index=index,
+                    total=total,
+                    status=item.get("status", "pending"),
+                    is_current=question_id == current_id,
+                    answer_kind=answer.answer_kind if answer else None,
+                    has_branch=bool(branches),
+                    branch_count=len(branches),
+                    active_branch_count=active_count,
+                    branch_label=f"B{question_id}" if branches else None,
+                )
+            )
+        return timeline
+
+    def question_detail(self, project_id: str, question_id: str) -> QuestionDetail:
+        project_path = self.require_project(project_id)
+        queue = self._read_json(project_path / "questions" / "queue.json")
+        items = queue.get("items", [])
+        for index, item in enumerate(items, start=1):
+            if item.get("id") != question_id:
+                continue
+            answer = self._answers_by_question(project_id, queue.get("batch_id")).get(question_id)
+            branches = self.list_clarifications(project_id, question_id)
+            active_count = sum(1 for branch in branches if branch.status == "active")
+            return QuestionDetail(
+                project_id=project_id,
+                batch_id=queue.get("batch_id"),
+                question_id=question_id,
+                question=item["question"],
+                index=index,
+                total=len(items),
+                status=item.get("status", "pending"),
+                is_current=question_id == self.snapshot(project_id).current_question_id,
+                answer=answer,
+                clarifications=branches,
+                has_branch=bool(branches),
+                branch_count=len(branches),
+                active_branch_count=active_count,
+                branch_label=f"B{question_id}" if branches else None,
+            )
+        raise WorkflowError(f"Question does not exist in the active queue: {question_id}")
+
+    def adjacent_question_detail(
+        self,
+        project_id: str,
+        question_id: str,
+        direction: str,
+    ) -> QuestionDetail | None:
+        normalized = direction.strip().lower()
+        if normalized not in {"previous", "next"}:
+            raise WorkflowError("direction must be 'previous' or 'next'.")
+        project_path = self.require_project(project_id)
+        queue = self._read_json(project_path / "questions" / "queue.json")
+        items = queue.get("items", [])
+        for index, item in enumerate(items):
+            if item.get("id") != question_id:
+                continue
+            target_index = index - 1 if normalized == "previous" else index + 1
+            if target_index < 0 or target_index >= len(items):
+                return None
+            return self.question_detail(project_id, items[target_index]["id"])
+        raise WorkflowError(f"Question does not exist in the active queue: {question_id}")
+
     def submit_answer(self, project_id: str, answer_text: str | None) -> QuestionAdvanceResult:
+        current = self.current_question(project_id)
+        if current is None:
+            raise WorkflowError("No active question is available.")
+        return self.submit_answer_for_question(project_id, current.question_id, answer_text)
+
+    def submit_answer_for_question(
+        self,
+        project_id: str,
+        question_id: str,
+        answer_text: str | None,
+    ) -> QuestionAdvanceResult:
         project_path = self.require_project(project_id)
         queue_path = project_path / "questions" / "queue.json"
         queue = self._read_json(queue_path)
         items = queue.get("items", [])
-        index = int(queue.get("current_index") or 0)
-        if not items or index >= len(items):
+        if not items:
             raise WorkflowError("No active question is available.")
+        index = self._question_index(queue, question_id)
 
         item = items[index]
         answer_kind, normalized_text = normalize_answer_text(answer_text)
@@ -260,18 +371,19 @@ class FileRepository:
             if existing.get("question_id") != item["id"]
         ]
         answers_payload["answers"].append(answer.model_dump(mode="json"))
+        answers_payload["answers"] = self._sort_answers(items, answers_payload["answers"])
 
-        next_index = index + 1
-        queue["current_index"] = next_index
+        next_index = self._first_pending_question_index(items)
+        queue["current_index"] = next_index if next_index is not None else len(items)
         self._write_json(queue_path, queue)
         self._write_json(answers_path, answers_payload)
 
-        if next_index >= len(items):
+        if next_index is None:
             state.update(
                 {
                     "phase": "batch_complete",
                     "current_question_id": None,
-                    "current_question_index": next_index,
+                    "current_question_index": len(items),
                     "batch_complete": True,
                     "reasoning_needed": True,
                 }
@@ -294,6 +406,35 @@ class FileRepository:
             batch_complete=bool(state["batch_complete"]),
             current_question=self.current_question(project_id),
         )
+
+    def open_clarification_session(self, project_id: str, question_id: str) -> ClarificationSession:
+        self.require_project(project_id)
+        self._find_question(project_id, question_id)
+        for session in self.list_clarifications(project_id, question_id):
+            if session.status == "active":
+                return session
+        session_id = f"clarification_{self._next_index(self.project_path(project_id) / 'clarifications', 'clarification_'):04d}"
+        session = ClarificationSession(
+            session_id=session_id,
+            project_id=project_id,
+            question_id=question_id,
+        )
+        self._write_json(
+            self.project_path(project_id) / "clarifications" / f"{session_id}.json",
+            session.model_dump(mode="json"),
+        )
+        self.append_event(project_id, "clarification_opened", {"session_id": session_id, "question_id": question_id})
+        return session
+
+    def list_clarifications(self, project_id: str, question_id: str) -> list[ClarificationSession]:
+        self.require_project(project_id)
+        self._find_question(project_id, question_id)
+        sessions = []
+        for path in sorted((self.project_path(project_id) / "clarifications").glob("*.json")):
+            session = ClarificationSession.model_validate(self._read_json(path))
+            if session.question_id == question_id:
+                sessions.append(session)
+        return sessions
 
     def create_clarification_session(
         self, project_id: str, question_id: str, user_question: str
@@ -374,6 +515,51 @@ class FileRepository:
             if item.get("id") == question_id:
                 return item
         raise WorkflowError(f"Question does not exist in the active queue: {question_id}")
+
+    def _question_index(self, queue: dict[str, Any], question_id: str) -> int:
+        for index, item in enumerate(queue.get("items", [])):
+            if item.get("id") == question_id:
+                return index
+        raise WorkflowError(f"Question does not exist in the active queue: {question_id}")
+
+    def _first_pending_question_index(self, items: list[dict[str, Any]]) -> int | None:
+        for index, item in enumerate(items):
+            if item.get("status", "pending") == "pending":
+                return index
+        return None
+
+    def _sort_answers(
+        self,
+        items: list[dict[str, Any]],
+        answers: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        order = {item.get("id"): index for index, item in enumerate(items)}
+        return sorted(answers, key=lambda answer: order.get(answer.get("question_id"), len(order)))
+
+    def _answers_by_question(
+        self,
+        project_id: str,
+        batch_id: str | None,
+    ) -> dict[str, AnswerRecord]:
+        if batch_id is None:
+            return {}
+        path = self.project_path(project_id) / "answers" / "batches" / f"{batch_id}.json"
+        if not path.exists():
+            return {}
+        payload = self._read_json(path)
+        records = {}
+        for item in payload.get("answers", []):
+            record = AnswerRecord.model_validate(item)
+            records[record.question_id] = record
+        return records
+
+    def _clarifications_by_question(self, project_id: str) -> dict[str, list[ClarificationSession]]:
+        grouped: dict[str, list[ClarificationSession]] = {}
+        project_path = self.require_project(project_id)
+        for path in sorted((project_path / "clarifications").glob("*.json")):
+            session = ClarificationSession.model_validate(self._read_json(path))
+            grouped.setdefault(session.question_id, []).append(session)
+        return grouped
 
     def _validate_project_id(self, project_id: str) -> None:
         if not PROJECT_ID_RE.match(project_id):

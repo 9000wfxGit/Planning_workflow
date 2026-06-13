@@ -193,3 +193,43 @@ class ClarificationCloseResult(StrictModel):
     status: Literal["closed"]
     attached_to_answer_context: bool
 
+
+class QuestionTimelineItem(StrictModel):
+    project_id: str
+    batch_id: str | None = None
+    question_id: str
+    question: str
+    index: int
+    total: int
+    status: Literal["pending", "answered", "blank"]
+    is_current: bool
+    answer_kind: Literal["answered", "blank"] | None = None
+    has_branch: bool = False
+    branch_count: int = 0
+    active_branch_count: int = 0
+    branch_label: str | None = None
+
+
+class QuestionDetail(StrictModel):
+    project_id: str
+    batch_id: str | None = None
+    question_id: str
+    question: str
+    index: int
+    total: int
+    status: Literal["pending", "answered", "blank"]
+    is_current: bool
+    answer: AnswerRecord | None = None
+    clarifications: list[ClarificationSession] = Field(default_factory=list)
+    has_branch: bool = False
+    branch_count: int = 0
+    active_branch_count: int = 0
+    branch_label: str | None = None
+
+
+class ProjectUiState(StrictModel):
+    project: ProjectSnapshot
+    timeline: list[QuestionTimelineItem] = Field(default_factory=list)
+    current_question: QuestionDetail | None = None
+    question_count: int = 0
+

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+import re
+from uuid import uuid4
 
 from planning_workflow.agents.questioning import QuestioningAgent
 from planning_workflow.agents.reasoning import ReasoningAgent
@@ -13,7 +16,9 @@ from planning_workflow.domain.models import (
     ClarificationSession,
     CycleResult,
     ProjectSnapshot,
+    ProjectUiState,
     QuestionAdvanceResult,
+    QuestionDetail,
     QuestionPrompt,
 )
 from planning_workflow.providers.config import load_settings
@@ -48,6 +53,19 @@ class PlanningWorkflowService:
     def create_project(self, project_id: str, initial_message: str) -> ProjectSnapshot:
         return self.repository.create_project(project_id, initial_message)
 
+    def create_auto_project(
+        self,
+        initial_message: str,
+        project_id_prefix: str = "project",
+    ) -> ProjectSnapshot:
+        prefix = self._normalize_project_id_prefix(project_id_prefix)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        for _ in range(100):
+            project_id = f"{prefix}-{timestamp}-{uuid4().hex[:8]}"
+            if not self.repository.project_path(project_id).exists():
+                return self.create_project(project_id, initial_message)
+        raise RuntimeError("Could not allocate a unique project id.")
+
     def run_reasoning_cycle(self, project_id: str) -> CycleResult:
         self.repository.require_project(project_id)
         cycle_id = self.repository.next_cycle_id(project_id)
@@ -70,8 +88,34 @@ class PlanningWorkflowService:
     def get_current_question(self, project_id: str) -> QuestionPrompt | None:
         return self.repository.current_question(project_id)
 
+    def get_project_ui_state(self, project_id: str) -> ProjectUiState:
+        return self.repository.project_ui_state(project_id)
+
+    def get_question(self, project_id: str, question_id: str) -> QuestionDetail:
+        return self.repository.question_detail(project_id, question_id)
+
+    def get_previous_question(self, project_id: str, question_id: str) -> QuestionDetail | None:
+        return self.repository.adjacent_question_detail(project_id, question_id, "previous")
+
+    def get_next_question(self, project_id: str, question_id: str) -> QuestionDetail | None:
+        return self.repository.adjacent_question_detail(project_id, question_id, "next")
+
     def submit_answer(self, project_id: str, answer_text: str | None = None) -> QuestionAdvanceResult:
         return self.repository.submit_answer(project_id, answer_text)
+
+    def submit_answer_for_question(
+        self,
+        project_id: str,
+        question_id: str,
+        answer_text: str | None = None,
+    ) -> QuestionAdvanceResult:
+        return self.repository.submit_answer_for_question(project_id, question_id, answer_text)
+
+    def open_clarification(self, project_id: str, question_id: str) -> ClarificationSession:
+        return self.repository.open_clarification_session(project_id, question_id)
+
+    def list_clarifications(self, project_id: str, question_id: str) -> list[ClarificationSession]:
+        return self.repository.list_clarifications(project_id, question_id)
 
     def start_clarification(
         self,
@@ -122,3 +166,9 @@ class PlanningWorkflowService:
         final_answer: str | None = None,
     ) -> ClarificationCloseResult:
         return self.repository.close_clarification(session_id, final_answer)
+
+    def _normalize_project_id_prefix(self, prefix: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", (prefix or "").strip()).strip(".-_")
+        if not cleaned or not cleaned[0].isalnum():
+            return "project"
+        return cleaned

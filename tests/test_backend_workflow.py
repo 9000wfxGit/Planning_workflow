@@ -88,6 +88,19 @@ class BackendWorkflowTests(unittest.TestCase):
             self.assertFalse((project / "current_plan.md").exists())
             self.assertFalse((project / "handoff" / "current_project_brief.md").exists())
 
+    def test_auto_project_creation_allocates_initialized_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self.make_service(root)
+            snapshot = service.create_auto_project(
+                "Build a planner from the UI.",
+                project_id_prefix="ui-project",
+            )
+
+            self.assertTrue(snapshot.project_id.startswith("ui-project-"))
+            self.assertEqual(snapshot.phase, "created")
+            self.assertTrue(snapshot.project_path.is_dir())
+
     def test_reasoning_cycle_writes_plan_handoff_and_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -101,6 +114,39 @@ class BackendWorkflowTests(unittest.TestCase):
             current = service.get_current_question("project-001")
             self.assertIsNotNone(current)
             self.assertEqual(current.question_id, "Q1")
+
+    def test_ui_state_navigation_selected_answer_and_branch_indicator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self.make_service(root, FakeReasoningAgent(question_count=3))
+            service.create_project("project-001", "Build a planner.")
+            service.run_reasoning_cycle("project-001")
+
+            session = service.open_clarification("project-001", "Q1")
+            self.assertEqual(session.messages, [])
+
+            state = service.get_project_ui_state("project-001")
+            self.assertEqual(state.question_count, 3)
+            self.assertIsNotNone(state.current_question)
+            self.assertEqual(state.current_question.question_id, "Q1")
+            self.assertEqual(state.timeline[0].branch_label, "BQ1")
+            self.assertEqual(state.timeline[0].branch_count, 1)
+            self.assertEqual(state.timeline[0].active_branch_count, 1)
+
+            self.assertIsNone(service.get_previous_question("project-001", "Q1"))
+            self.assertEqual(service.get_next_question("project-001", "Q1").question_id, "Q2")
+
+            service.submit_answer_for_question("project-001", "Q2", "Answer Q2 first.")
+            state = service.get_project_ui_state("project-001")
+            self.assertEqual(state.current_question.question_id, "Q1")
+            self.assertEqual(state.timeline[1].answer_kind, "answered")
+            detail = service.get_question("project-001", "Q2")
+            self.assertIsNotNone(detail.answer)
+            self.assertEqual(detail.answer.answer_text, "Answer Q2 first.")
+
+            service.close_clarification(session.session_id, "Q1 is now clear.")
+            state = service.get_project_ui_state("project-001")
+            self.assertEqual(state.timeline[0].active_branch_count, 0)
 
     def test_question_batch_rejects_more_than_seven_questions(self) -> None:
         questions = [

@@ -33,6 +33,30 @@ Local credentials live in `.env`, which is intentionally ignored by Git. `.env.e
 
 DeepSeek defaults to `deepseek-v4-pro` with thinking enabled. The deprecated `deepseek-reasoner` name is not used.
 
+## Gateway and UI Attachment
+
+The backend remains framework-free. A gateway should import
+`PlanningWorkflowService`, expose thin HTTP routes, and keep the UI in a
+separate `UI/` folder.
+
+- `create_auto_project(initial_message)` creates a new project folder for an
+  instant "new project" UI flow.
+- `get_project_ui_state(project_id)` returns the compact screen state:
+  project phase, question timeline, current question, answer status, and branch
+  indicators.
+- `get_question(project_id, question_id)` returns one question, its saved
+  answer, and its clarification branch sessions.
+- `get_previous_question(...)` and `get_next_question(...)` support back/next
+  controls without mutating workflow state.
+- `submit_answer_for_question(project_id, question_id, answer_text)` lets a UI
+  save the answer for a selected question while the backend moves to the first
+  remaining pending question.
+- `open_clarification(...)`, `send_clarification_message(...)`, and
+  `close_clarification(...)` back the per-question branch chat window.
+
+The UI should call the gateway only. It should not read or write `projects/`
+files directly.
+
 ## Testing
 
 ```powershell
