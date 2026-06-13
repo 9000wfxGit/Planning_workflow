@@ -3,15 +3,19 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "project-reasoner-workflow"
-version = "0.1.0"
-description = "Backend-first idea-to-plan workflow with a mechanical Python core and separate reasoning adapter."
+name = "planning-workflow"
+version = "0.2.0"
+description = "Backend-first reasoning workflow for turning rough ideas into handoff-ready project plans."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "httpx>=0.27,<1",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+]
 authors = [
-  { name = "Project Reasoner Workflow" }
+  { name = "Planning Workflow" }
 ]
 
 [tool.setuptools.packages.find]
-include = ["planning_agent_system*"]
+include = ["planning_workflow*"]
