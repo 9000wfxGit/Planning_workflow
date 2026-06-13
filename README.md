@@ -59,6 +59,29 @@ python scripts/apply_command.py --project-id project-001 --command finalize
 python scripts/inspect_project.py --project-id project-001
 ```
 
+## Gateway and UI Attachment
+
+The core remains framework-free. A gateway should import `planning_agent_system.core`
+and expose thin HTTP routes over these backend functions:
+
+- `create_auto_project(root, idea)` creates a new initialized project folder for
+  an instant "new project" UI flow.
+- `get_project_ui_state(project_path)` returns the compact screen state:
+  project phase, question timeline, current question, answer status, and branch
+  indicators.
+- `get_question_detail(project_path, question_id)` returns one question, its
+  saved answer, and its branch chat threads.
+- `get_previous_question_detail(...)` and `get_next_question_detail(...)`
+  support back/next controls without mutating workflow state.
+- `save_answer_for_question(project_path, question_id, answer_text)` lets a UI
+  save the answer for the selected question while the backend moves the workflow
+  to the first remaining pending question.
+- `get_or_start_question_branch(...)`, `append_question_branch_message(...)`,
+  and `close_question_branch(...)` back the per-question branch chat window.
+
+The UI should live in a separate `UI/` folder and call the gateway only. It
+should not read or write `projects/` files directly.
+
 `scripts/reasoning_agent_stub.py` is a deterministic local stand-in for a real
 reasoning model. It is intentionally outside the interview engine so the core
 can later call DeepSeek, Claude, GPT, or another reasoning model without moving

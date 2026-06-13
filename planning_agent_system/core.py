@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+from uuid import uuid4
 
 from .structured_yaml import StructuredYamlError, load_yaml_file, write_yaml_file
 
@@ -170,6 +171,21 @@ def create_project(root: str | Path | None, project_id: str, idea: str) -> Path:
     if project_path.exists():
         raise WorkflowError(f"Project already exists: {project_path}")
     return initialize_planning(project_path, project_id, idea)
+
+
+def create_auto_project(
+    root: str | Path | None,
+    idea: str,
+    project_id_prefix: str = "project",
+) -> Path:
+    prefix = _normalize_project_id_prefix(project_id_prefix)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    for _ in range(100):
+        project_id = f"{prefix}-{timestamp}-{uuid4().hex[:8]}"
+        project_path = project_dir(root, project_id)
+        if not project_path.exists():
+            return initialize_planning(project_path, project_id, idea)
+    raise WorkflowError("Could not allocate a unique project id.")
 
 
 def default_rule_set() -> dict[str, Any]:
@@ -372,16 +388,148 @@ def current_question(project_path: Path) -> CurrentQuestion | None:
     )
 
 
+def get_question_timeline(project_path: Path) -> list[dict[str, Any]]:
+    queue = _load_queue(project_path)
+    items = queue.get("items", [])
+    answers_by_question = _answers_by_question(project_path)
+    branches_by_question = _branches_by_question(project_path)
+    current_id = _current_question_id_from_state_or_queue(project_path, queue)
+    total = len(items)
+    timeline = []
+    for index, item in enumerate(items):
+        question_id = item["id"]
+        answer = answers_by_question.get(question_id)
+        branches = branches_by_question.get(question_id, [])
+        active_branch_count = len(
+            [branch for branch in branches if branch.get("status") == "active"]
+        )
+        timeline.append(
+            {
+                "project_id": project_path.name,
+                "batch_id": queue.get("batch_id"),
+                "question_id": question_id,
+                "label": question_id,
+                "question": item["question"],
+                "scope": item.get("scope"),
+                "index": index,
+                "display_index": index + 1,
+                "total": total,
+                "status": item.get("status", "pending"),
+                "is_current": question_id == current_id,
+                "has_answer": answer is not None,
+                "answer_status": answer.get("status") if answer else None,
+                "has_branch": bool(branches),
+                "branch_count": len(branches),
+                "active_branch_count": active_branch_count,
+                "branch_label": _branch_label_for(question_id) if branches else None,
+            }
+        )
+    return timeline
+
+
+def get_question_detail(project_path: Path, question_id: str) -> dict[str, Any]:
+    queue = _load_queue(project_path)
+    index = _question_index(queue, question_id)
+    item = queue["items"][index]
+    answer = _answers_by_question(project_path).get(question_id)
+    branches = list_question_branches(project_path, question_id)
+    current_id = _current_question_id_from_state_or_queue(project_path, queue)
+    return {
+        "project_id": project_path.name,
+        "batch_id": queue.get("batch_id"),
+        "question_id": question_id,
+        "label": question_id,
+        "question": item["question"],
+        "scope": item.get("scope"),
+        "index": index,
+        "display_index": index + 1,
+        "total": len(queue.get("items", [])),
+        "status": item.get("status", "pending"),
+        "is_current": question_id == current_id,
+        "answer": answer,
+        "has_answer": answer is not None,
+        "has_branch": bool(branches),
+        "branch_count": len(branches),
+        "branch_label": _branch_label_for(question_id) if branches else None,
+        "branch_threads": branches,
+    }
+
+
+def get_adjacent_question_detail(
+    project_path: Path,
+    question_id: str,
+    direction: str,
+) -> dict[str, Any] | None:
+    normalized = direction.strip().lower()
+    if normalized not in {"previous", "next"}:
+        raise WorkflowError("direction must be 'previous' or 'next'.")
+    queue = _load_queue(project_path)
+    index = _question_index(queue, question_id)
+    target_index = index - 1 if normalized == "previous" else index + 1
+    items = queue.get("items", [])
+    if target_index < 0 or target_index >= len(items):
+        return None
+    return get_question_detail(project_path, items[target_index]["id"])
+
+
+def get_previous_question_detail(
+    project_path: Path,
+    question_id: str,
+) -> dict[str, Any] | None:
+    return get_adjacent_question_detail(project_path, question_id, "previous")
+
+
+def get_next_question_detail(
+    project_path: Path,
+    question_id: str,
+) -> dict[str, Any] | None:
+    return get_adjacent_question_detail(project_path, question_id, "next")
+
+
+def get_project_ui_state(project_path: Path) -> dict[str, Any]:
+    state = _load_runtime_state(project_path)
+    queue = _load_queue(project_path)
+    current_id = _current_question_id_from_state_or_queue(project_path, queue)
+    timeline = get_question_timeline(project_path)
+    return {
+        "project_id": project_path.name,
+        "project_path": str(project_path.resolve()),
+        "current_phase": state.get("current_phase"),
+        "active_batch_id": state.get("active_batch_id"),
+        "batch_complete": bool(state.get("batch_complete")),
+        "waiting_for_user_continue": bool(state.get("waiting_for_user_continue")),
+        "reasoning_needed": bool(state.get("reasoning_needed")),
+        "reasoning_allowed": bool(state.get("reasoning_allowed")),
+        "has_questions": bool(queue.get("items")),
+        "question_count": len(queue.get("items", [])),
+        "timeline": timeline,
+        "current_question": (
+            get_question_detail(project_path, current_id)
+            if current_id is not None
+            else None
+        ),
+    }
+
+
 def save_answer(project_path: Path, answer_text: str) -> dict[str, Any]:
+    current = current_question(project_path)
+    if current is None:
+        raise WorkflowError("No active question is available.")
+    return save_answer_for_question(project_path, current.question_id, answer_text)
+
+
+def save_answer_for_question(
+    project_path: Path,
+    question_id: str,
+    answer_text: str,
+) -> dict[str, Any]:
     if answer_text is None or answer_text.strip() == "":
         raise WorkflowError("Answer text is required.")
     queue = _load_queue(project_path)
     items = queue.get("items", [])
     if not items:
         raise WorkflowError("No question queue is active.")
-    index = int(queue.get("current_index", 0) or 0)
-    if index >= len(items):
-        raise WorkflowError("The active question batch is already complete.")
+    index = _question_index(queue, question_id)
 
     item = items[index]
     item["status"] = "answered"
@@ -398,19 +546,20 @@ def save_answer(project_path: Path, answer_text: str) -> dict[str, Any]:
         if existing.get("question_id") != answer_record["question_id"]
     ]
     answers.append(answer_record)
+    answers = _sort_answers_for_queue(items, answers)
 
-    next_index = index + 1
-    queue["current_index"] = next_index
+    pending_index = _first_pending_question_index(items)
+    queue["current_index"] = pending_index if pending_index is not None else len(items)
     _write_json(project_path / "question_queue.json", queue)
     _write_answers(project_path, queue["batch_id"], answers)
 
     state = _load_runtime_state(project_path)
-    if next_index >= len(items):
+    if pending_index is None:
         state.update(
             {
                 "current_phase": "waiting_for_user_continue",
                 "current_question_id": None,
-                "current_question_index": next_index,
+                "current_question_index": len(items),
                 "batch_complete": True,
                 "waiting_for_user_continue": True,
                 "user_approved_continue": False,
@@ -423,8 +572,8 @@ def save_answer(project_path: Path, answer_text: str) -> dict[str, Any]:
         state.update(
             {
                 "current_phase": "asking_questions",
-                "current_question_id": items[next_index]["id"],
-                "current_question_index": next_index,
+                "current_question_id": items[pending_index]["id"],
+                "current_question_index": pending_index,
                 "batch_complete": False,
                 "waiting_for_user_continue": False,
                 "reasoning_needed": False,
@@ -578,6 +727,90 @@ def log_side_question(
     return entry
 
 
+def list_question_branches(project_path: Path, question_id: str) -> list[dict[str, Any]]:
+    _question_index(_load_queue(project_path), question_id)
+    threads = _load_side_threads(project_path).get("threads", [])
+    return [
+        thread
+        for thread in threads
+        if thread.get("question_id") == question_id
+    ]
+
+
+def get_or_start_question_branch(project_path: Path, question_id: str) -> dict[str, Any]:
+    for thread in list_question_branches(project_path, question_id):
+        if thread.get("status") == "active":
+            return thread
+    return start_question_branch(project_path, question_id)
+
+
+def start_question_branch(
+    project_path: Path,
+    question_id: str,
+    initial_message: str | None = None,
+) -> dict[str, Any]:
+    _question_index(_load_queue(project_path), question_id)
+    payload = _load_side_threads(project_path)
+    threads = payload.setdefault("threads", [])
+    thread_id = _next_question_branch_id(threads)
+    now = _timestamp()
+    messages: list[dict[str, Any]] = []
+    if initial_message is not None and initial_message.strip():
+        messages.append(_branch_message("user", initial_message))
+    thread = {
+        "thread_id": thread_id,
+        "branch_label": _branch_label_for(question_id),
+        "question_id": question_id,
+        "status": "active",
+        "messages": messages,
+        "created_at": now,
+        "updated_at": now,
+    }
+    threads.append(thread)
+    _write_side_threads(project_path, payload)
+    return thread
+
+
+def append_question_branch_message(
+    project_path: Path,
+    thread_id: str,
+    role: str,
+    content: str,
+) -> dict[str, Any]:
+    if not content.strip():
+        raise WorkflowError("Branch message content is required.")
+    message = _branch_message(role, content)
+    payload = _load_side_threads(project_path)
+    for thread in payload.get("threads", []):
+        if thread.get("thread_id") != thread_id:
+            continue
+        if thread.get("status") != "active":
+            raise WorkflowError(f"Question branch is not active: {thread_id}")
+        thread.setdefault("messages", []).append(message)
+        thread["updated_at"] = message["created_at"]
+        _write_side_threads(project_path, payload)
+        return thread
+    raise WorkflowError(f"Question branch does not exist: {thread_id}")
+
+
+def close_question_branch(
+    project_path: Path,
+    thread_id: str,
+    final_summary: str = "",
+) -> dict[str, Any]:
+    payload = _load_side_threads(project_path)
+    for thread in payload.get("threads", []):
+        if thread.get("thread_id") != thread_id:
+            continue
+        thread["status"] = "closed"
+        if final_summary.strip():
+            thread["final_summary"] = final_summary.strip()
+        thread["updated_at"] = _timestamp()
+        _write_side_threads(project_path, payload)
+        return thread
+    raise WorkflowError(f"Question branch does not exist: {thread_id}")
+
+
 def mark_reasoning_completed(project_path: Path, produced_questions: bool) -> dict[str, Any]:
     state = _load_runtime_state(project_path)
     state.update(
@@ -626,6 +859,121 @@ def load_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise WorkflowError(f"Could not read JSON file {path}: {exc}") from exc
+
+
+def _normalize_project_id_prefix(prefix: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", (prefix or "").strip())
+    cleaned = cleaned.strip(".-_")
+    if not cleaned or not cleaned[0].isalnum() or not PROJECT_ID_RE.match(cleaned):
+        return "project"
+    return cleaned
+
+
+def _current_question_id_from_state_or_queue(
+    project_path: Path,
+    queue: dict[str, Any],
+) -> str | None:
+    state = _load_runtime_state(project_path)
+    state_question_id = state.get("current_question_id")
+    if isinstance(state_question_id, str):
+        try:
+            _question_index(queue, state_question_id)
+            return state_question_id
+        except WorkflowError:
+            pass
+    return _current_question_id_from_queue(queue)
+
+
+def _question_index(queue: dict[str, Any], question_id: str) -> int:
+    if not isinstance(question_id, str) or not question_id.strip():
+        raise WorkflowError("Question id is required.")
+    for index, item in enumerate(queue.get("items", [])):
+        if isinstance(item, dict) and item.get("id") == question_id:
+            return index
+    raise WorkflowError(f"Question does not exist in the active queue: {question_id}")
+
+
+def _answers_by_question(project_path: Path) -> dict[str, dict[str, Any]]:
+    answers = _load_answers(project_path).get("answers", [])
+    return {
+        answer["question_id"]: answer
+        for answer in answers
+        if isinstance(answer, dict) and isinstance(answer.get("question_id"), str)
+    }
+
+
+def _branches_by_question(project_path: Path) -> dict[str, list[dict[str, Any]]]:
+    by_question: dict[str, list[dict[str, Any]]] = {}
+    for thread in _load_side_threads(project_path).get("threads", []):
+        question_id = thread.get("question_id")
+        if isinstance(question_id, str):
+            by_question.setdefault(question_id, []).append(thread)
+    return by_question
+
+
+def _branch_label_for(question_id: str) -> str:
+    return f"B{question_id}"
+
+
+def _sort_answers_for_queue(
+    items: list[dict[str, Any]],
+    answers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    order = {
+        item.get("id"): index
+        for index, item in enumerate(items)
+        if isinstance(item, dict)
+    }
+    return sorted(
+        answers,
+        key=lambda answer: order.get(answer.get("question_id"), len(order)),
+    )
+
+
+def _first_pending_question_index(items: list[dict[str, Any]]) -> int | None:
+    for index, item in enumerate(items):
+        if item.get("status", "pending") == "pending":
+            return index
+    return None
+
+
+def _load_side_threads(project_path: Path) -> dict[str, Any]:
+    path = project_path / "side_threads.json"
+    if not path.exists():
+        return {"threads": []}
+    data = load_json(path)
+    threads = data.get("threads", [])
+    if not isinstance(threads, list):
+        raise WorkflowError("side_threads.json must contain a threads list.")
+    return {"threads": [thread for thread in threads if isinstance(thread, dict)]}
+
+
+def _write_side_threads(project_path: Path, payload: dict[str, Any]) -> None:
+    _write_json(project_path / "side_threads.json", {"threads": payload.get("threads", [])})
+
+
+def _next_question_branch_id(threads: list[dict[str, Any]]) -> str:
+    highest = 0
+    for thread in threads:
+        thread_id = str(thread.get("thread_id", ""))
+        match = re.fullmatch(r"BQ(\d+)", thread_id)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return f"BQ{highest + 1:03d}"
+
+
+def _branch_message(role: str, content: str) -> dict[str, Any]:
+    normalized_role = role.strip().lower()
+    if normalized_role not in {"user", "assistant"}:
+        raise WorkflowError("Branch message role must be 'user' or 'assistant'.")
+    text = content.strip()
+    if not text:
+        raise WorkflowError("Branch message content is required.")
+    return {
+        "role": normalized_role,
+        "content": text,
+        "created_at": _timestamp(),
+    }
 
 
 def _validate_questions_data(data: Any, path: Path) -> None:

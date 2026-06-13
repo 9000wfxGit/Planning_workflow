@@ -72,6 +72,20 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(core.WorkflowError):
                 core.start_or_resume_project(project)
 
+    def test_auto_project_creation_allocates_initialized_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = core.create_auto_project(
+                temp,
+                "Start a new project immediately from the UI.",
+                project_id_prefix="ui-project",
+            )
+
+            self.assertTrue(project.name.startswith("ui-project-"))
+            status = core.get_project_status(project)
+            self.assertTrue(status["exists"])
+            self.assertTrue(status["is_initialized"])
+            self.assertEqual(status["current_phase"], "initialized")
+
     def test_initialized_project_runs_first_reasoning_and_interview(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "project-001"
@@ -88,6 +102,43 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(status["has_questions"])
             self.assertEqual(status["current_question_id"], "Q1")
             self.assertEqual(queue["items"][0]["id"], "Q1")
+
+    def test_ui_state_exposes_timeline_navigation_answers_and_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = core.create_project(root, "project-001", "Build a UI adapter.")
+            reasoning_stub.initial_reasoning(project)
+            core.create_question_queue(project)
+
+            branch = core.start_question_branch(project, "Q1", "What does Q1 mean?")
+            branch = core.append_question_branch_message(
+                project,
+                branch["thread_id"],
+                "assistant",
+                "It asks whether the backend works without a UI.",
+            )
+
+            state = core.get_project_ui_state(project)
+            self.assertEqual(state["question_count"], 5)
+            self.assertEqual(state["current_question"]["question_id"], "Q1")
+            self.assertEqual(state["timeline"][0]["branch_label"], "BQ1")
+            self.assertEqual(state["timeline"][0]["branch_count"], 1)
+            self.assertEqual(state["timeline"][0]["active_branch_count"], 1)
+
+            detail = core.get_question_detail(project, "Q1")
+            self.assertEqual(detail["branch_threads"][0]["thread_id"], branch["thread_id"])
+            self.assertEqual(len(detail["branch_threads"][0]["messages"]), 2)
+            self.assertIsNone(core.get_previous_question_detail(project, "Q1"))
+            self.assertEqual(core.get_next_question_detail(project, "Q1")["question_id"], "Q2")
+
+            core.save_answer_for_question(project, "Q2", "Answering Q2 from a selected UI card.")
+            state = core.get_project_ui_state(project)
+            self.assertEqual(state["current_question"]["question_id"], "Q1")
+            self.assertEqual(state["timeline"][1]["answer_status"], "answered")
+
+            core.close_question_branch(project, branch["thread_id"], "Q1 is clear now.")
+            state = core.get_project_ui_state(project)
+            self.assertEqual(state["timeline"][0]["active_branch_count"], 0)
 
     def test_end_to_end_batch_waits_for_continue(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
