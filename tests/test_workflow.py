@@ -10,6 +10,85 @@ from planning_agent_system.structured_yaml import load_yaml_file, write_yaml_fil
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_project_status_for_missing_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            status = core.get_project_status(Path(temp) / "missing")
+
+            self.assertEqual(
+                status,
+                {
+                    "exists": False,
+                    "current_phase": None,
+                    "is_initialized": False,
+                    "has_questions": False,
+                    "current_question_id": None,
+                },
+            )
+
+    def test_initialize_planning_creates_backend_owned_start_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "projects" / "project-001"
+
+            initialized = core.initialize_planning(
+                project,
+                project_name="Test Project",
+                initial_prompt="Make rough ideas buildable.",
+            )
+
+            self.assertEqual(initialized, project.resolve())
+            state = load_yaml_file(project / "runtime_state.yaml")
+            self.assertEqual(state["current_phase"], "initialized")
+            self.assertIsNone(state["current_question_id"])
+            self.assertIsNone(state["current_question_index"])
+            self.assertEqual(state["questions"], [])
+            self.assertTrue(state["reasoning_allowed"])
+            self.assertEqual(state["requested_action"], "initial_reasoning")
+            queue = json.loads((project / "question_queue.json").read_text(encoding="utf-8"))
+            self.assertEqual(queue["items"], [])
+            self.assertTrue((project / "project_settings.yaml").exists())
+            self.assertEqual(
+                json.loads((project / "side_threads.json").read_text(encoding="utf-8")),
+                {"threads": []},
+            )
+
+    def test_start_or_resume_project_initializes_then_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project-001"
+
+            created = core.start_or_resume_project(project, initial_prompt="Start here.")
+            resumed = core.start_or_resume_project(project)
+
+            self.assertTrue(created["exists"])
+            self.assertTrue(created["is_initialized"])
+            self.assertEqual(created["current_phase"], "initialized")
+            self.assertEqual(created, resumed)
+
+    def test_start_or_resume_project_rejects_partial_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project-001"
+            project.mkdir()
+            (project / "notes.md").write_text("partial", encoding="utf-8")
+
+            with self.assertRaises(core.WorkflowError):
+                core.start_or_resume_project(project)
+
+    def test_initialized_project_runs_first_reasoning_and_interview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "project-001"
+            core.initialize_planning(project, initial_prompt="Make planning start cleanly.")
+
+            reasoning_stub.initial_reasoning(project)
+            status = core.get_project_status(project)
+            self.assertEqual(status["current_phase"], "reasoning_output_ready")
+            self.assertFalse(status["has_questions"])
+
+            queue = core.create_question_queue(project)
+            status = core.get_project_status(project)
+            self.assertEqual(status["current_phase"], "asking_questions")
+            self.assertTrue(status["has_questions"])
+            self.assertEqual(status["current_question_id"], "Q1")
+            self.assertEqual(queue["items"][0]["id"], "Q1")
+
     def test_end_to_end_batch_waits_for_continue(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

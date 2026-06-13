@@ -16,6 +16,7 @@ PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 QUESTION_MIN = 3
 QUESTION_DEFAULT = 5
 QUESTION_MAX = 7
+PROJECT_SETTINGS_DEFAULTS = {"suppress_incomplete_batch_warning": False}
 
 
 class WorkflowError(RuntimeError):
@@ -53,47 +54,122 @@ def project_dir(root: str | Path | None, project_id: str) -> Path:
     return projects_dir(root) / require_project_id(project_id)
 
 
+def initialize_planning(
+    project_path: str | Path,
+    project_name: str | None = None,
+    initial_prompt: str | None = None,
+) -> Path:
+    path = Path(project_path).resolve()
+    if path.exists() and not path.is_dir():
+        raise WorkflowError(f"Project path is not a directory: {path}")
+    if path.exists() and any(path.iterdir()):
+        if get_project_status(path)["is_initialized"]:
+            raise WorkflowError(f"Project already initialized: {path}")
+        raise WorkflowError(
+            f"Project directory is not empty and is not initialized: {path}"
+        )
+
+    name = project_name or path.name
+    prompt = (initial_prompt or "").strip()
+    for directory in [
+        path,
+        path / "answers",
+        path / "questions",
+        path / "side_questions",
+        path / "exports",
+    ]:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    _write_text(
+        path / "initial_idea.md",
+        "# Initial Idea\n\n" + prompt + "\n",
+    )
+    _write_text(
+        path / "side_questions" / "side_questions_log.md",
+        "# Side Questions Log\n",
+    )
+    _write_text(
+        path / "side_questions" / "archived_side_questions.md",
+        "# Archived Side Questions\n",
+    )
+    _write_text(path / "idea_backlog.md", "# Idea Backlog\n")
+    _write_text(path / "interpreted_answers.md", "# Interpreted Answers\n")
+
+    write_yaml_file(path / "rule_set.yaml", default_rule_set())
+    write_yaml_file(path / "runtime_state.yaml", initial_runtime_state())
+    write_yaml_file(path / "project_state.yaml", initial_project_state(name))
+    write_yaml_file(path / "project_settings.yaml", default_project_settings())
+    write_yaml_file(
+        path / "side_questions" / "active_side_questions.yaml",
+        {"active_side_questions": []},
+    )
+
+    _write_json(
+        path / "question_queue.json",
+        {"batch_id": None, "source_file": None, "items": [], "current_index": 0},
+    )
+    _write_json(path / "raw_answers.json", {"batch_id": None, "answers": []})
+    _write_json(path / "side_threads.json", {"threads": []})
+    _write_text(path / "raw_answers.md", "# Raw Answers\n")
+    return path
+
+
+def start_or_resume_project(
+    project_path: str | Path,
+    project_name: str | None = None,
+    initial_prompt: str | None = None,
+) -> dict[str, Any]:
+    path = Path(project_path).resolve()
+    if not path.exists() or (path.is_dir() and not any(path.iterdir())):
+        initialize_planning(path, project_name, initial_prompt)
+        return get_project_status(path)
+    if not path.is_dir():
+        raise WorkflowError(f"Project path is not a directory: {path}")
+
+    status = get_project_status(path)
+    if not status["is_initialized"]:
+        raise WorkflowError(f"Project exists but is not initialized: {path}")
+    return status
+
+
+def get_project_status(project_path: str | Path) -> dict[str, Any]:
+    path = Path(project_path).resolve()
+    missing = {
+        "exists": False,
+        "current_phase": None,
+        "is_initialized": False,
+        "has_questions": False,
+        "current_question_id": None,
+    }
+    if not path.is_dir():
+        return missing
+    if validate_project_structure(path):
+        return missing
+
+    try:
+        state = _load_runtime_state(path)
+        queue = _load_queue(path)
+    except WorkflowError:
+        return missing
+
+    items = queue.get("items", [])
+    current_question_id = state.get("current_question_id") or _current_question_id_from_queue(
+        queue
+    )
+    return {
+        "exists": True,
+        "current_phase": state.get("current_phase"),
+        "is_initialized": True,
+        "has_questions": bool(items),
+        "current_question_id": current_question_id,
+    }
+
+
 def create_project(root: str | Path | None, project_id: str, idea: str) -> Path:
     project_path = project_dir(root, project_id)
     if project_path.exists():
         raise WorkflowError(f"Project already exists: {project_path}")
-
-    for directory in [
-        project_path,
-        project_path / "answers",
-        project_path / "questions",
-        project_path / "side_questions",
-        project_path / "exports",
-    ]:
-        directory.mkdir(parents=True, exist_ok=False)
-
-    _write_text(
-        project_path / "initial_idea.md",
-        "# Initial Idea\n\n" + idea.strip() + "\n",
-    )
-    _write_text(project_path / "side_questions" / "side_questions_log.md", "# Side Questions Log\n")
-    _write_text(
-        project_path / "side_questions" / "archived_side_questions.md",
-        "# Archived Side Questions\n",
-    )
-    _write_text(project_path / "idea_backlog.md", "# Idea Backlog\n")
-    _write_text(project_path / "interpreted_answers.md", "# Interpreted Answers\n")
-
-    write_yaml_file(project_path / "rule_set.yaml", default_rule_set())
-    write_yaml_file(project_path / "runtime_state.yaml", initial_runtime_state())
-    write_yaml_file(project_path / "project_state.yaml", initial_project_state())
-    write_yaml_file(project_path / "side_questions" / "active_side_questions.yaml", {"active_side_questions": []})
-
-    (project_path / "question_queue.json").write_text(
-        json.dumps({"batch_id": None, "items": [], "current_index": 0}, indent=2),
-        encoding="utf-8",
-    )
-    (project_path / "raw_answers.json").write_text(
-        json.dumps({"batch_id": None, "answers": []}, indent=2),
-        encoding="utf-8",
-    )
-    _write_text(project_path / "raw_answers.md", "# Raw Answers\n")
-    return project_path
+    return initialize_planning(project_path, project_id, idea)
 
 
 def default_rule_set() -> dict[str, Any]:
@@ -129,10 +205,11 @@ def default_rule_set() -> dict[str, Any]:
 
 def initial_runtime_state() -> dict[str, Any]:
     return {
-        "current_phase": "initial_idea_saved",
+        "current_phase": "initialized",
         "active_batch_id": None,
         "current_question_id": None,
-        "current_question_index": 0,
+        "current_question_index": None,
+        "questions": [],
         "batch_complete": False,
         "waiting_for_user_continue": False,
         "user_approved_continue": False,
@@ -147,8 +224,9 @@ def initial_runtime_state() -> dict[str, Any]:
     }
 
 
-def initial_project_state() -> dict[str, Any]:
+def initial_project_state(project_name: str | None = None) -> dict[str, Any]:
     return {
+        "project_name": project_name or "",
         "project_version": "v0.0",
         "core_goal": "",
         "current_focus": "awaiting initial reasoning",
@@ -156,20 +234,45 @@ def initial_project_state() -> dict[str, Any]:
     }
 
 
+def default_project_settings() -> dict[str, Any]:
+    return dict(PROJECT_SETTINGS_DEFAULTS)
+
+
 def validate_project_structure(project_path: Path) -> list[str]:
     errors: list[str] = []
     for relative in ["answers", "questions", "side_questions", "exports"]:
         if not (project_path / relative).is_dir():
             errors.append(f"Missing directory: {relative}")
-    for relative in ["initial_idea.md", "runtime_state.yaml", "rule_set.yaml"]:
+    for relative in [
+        "initial_idea.md",
+        "runtime_state.yaml",
+        "rule_set.yaml",
+        "project_state.yaml",
+        "project_settings.yaml",
+        "question_queue.json",
+        "raw_answers.json",
+        "side_threads.json",
+    ]:
         if not (project_path / relative).is_file():
             errors.append(f"Missing file: {relative}")
-    for relative in ["runtime_state.yaml", "rule_set.yaml", "project_state.yaml"]:
+    for relative in [
+        "runtime_state.yaml",
+        "rule_set.yaml",
+        "project_state.yaml",
+        "project_settings.yaml",
+    ]:
         path = project_path / relative
         if path.exists():
             try:
                 load_yaml_file(path)
             except StructuredYamlError as exc:
+                errors.append(str(exc))
+    for relative in ["question_queue.json", "raw_answers.json", "side_threads.json"]:
+        path = project_path / relative
+        if path.exists():
+            try:
+                load_json(path)
+            except WorkflowError as exc:
                 errors.append(str(exc))
     return errors
 
@@ -598,6 +701,15 @@ def _load_optional_yaml(path: Path) -> dict[str, Any]:
 
 def _load_queue(project_path: Path) -> dict[str, Any]:
     return load_json(project_path / "question_queue.json")
+
+
+def _current_question_id_from_queue(queue: dict[str, Any]) -> str | None:
+    items = queue.get("items", [])
+    index = int(queue.get("current_index", 0) or 0)
+    if not items or index < 0 or index >= len(items):
+        return None
+    item = items[index]
+    return item.get("id") if isinstance(item, dict) else None
 
 
 def _load_answers(project_path: Path) -> dict[str, Any]:
